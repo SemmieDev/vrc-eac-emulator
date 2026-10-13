@@ -78,9 +78,14 @@ REG_NAMES = (
 ).split()
 RDX = REG_NAMES.index("rdx")
 
-# Default for --mprotect-offset. Image-relative address of the wrapper EAC uses
-# to change the protection of the DLL page. Build specific; override if needed.
+# Image-relative offsets of the two EAC functions this tool needs. Both are
+# specific to the EAC build, so each is verified against its prologue before a
+# breakpoint is set; a mismatch is reported instead of silently doing nothing.
 DEFAULT_MPROTECT_OFFSET = 0x4DA93A
+DEFAULT_REPORT_OFFSET = 0x3599A
+
+MPROTECT_SIGNATURE = bytes.fromhex("f30f1efa554889e5534881ec8800000048897d88")
+REPORT_SIGNATURE = bytes.fromhex("f30f1efa41574156415541544189f4554889d5")
 
 # Value handed to mprotect that the kernel rejects (EINVAL), so the call fails.
 INVALID_PROT = 0x10
@@ -108,6 +113,24 @@ def dll_mapping(maps: str, name: str) -> int | None:
         if fields[5].lower().replace("\\", "/").endswith(suffix):
             return int(fields[0].split("-")[0], 16)
     return None
+
+
+def verify_signature(tracer: "Tracer", base: int, offset: int, signature: bytes, label: str) -> bool:
+    """Check the prologue so a stale offset is reported instead of silently ignored."""
+    address = base + offset
+    observed = tracer.read_memory(address, len(signature))
+    if observed == signature:
+        print(f"{label} {offset:#x}: prologue ok", flush=True)
+        return True
+    print(
+        f"{label} {offset:#x}: PROLOGUE MISMATCH\n"
+        f"  expected {signature.hex()}\n"
+        f"  observed {observed.hex()}\n"
+        f"  the EAC build probably changed; re-derive the offset",
+        file=sys.stderr,
+        flush=True,
+    )
+    return False
 
 
 def find_game_pid(exe: str, prefix: str | None) -> int | None:
@@ -170,13 +193,39 @@ class Tracer:
         self.regs[RDX] = value
         self.call(PTRACE_SETREGS, 0, ctypes.addressof(self.regs))
 
-    def set_exec_breakpoint(self, address: int) -> None:
-        self.call(PTRACE_POKEUSER, DEBUGREG_BASE, address)
-        # L0 = 1 enables DR0; execution breakpoints need no RW/LEN bits.
-        self.call(PTRACE_POKEUSER, DR7, 0x1)
+    def set_breakpoint(self, index: int, address: int) -> None:
+        self.call(PTRACE_POKEUSER, DEBUGREG_BASE + index * 8, address)
 
-    def breakpoint_hit(self) -> bool:
-        return bool(self.call(PTRACE_PEEKUSER, DR6) & 0x1)
+    def enable_breakpoints(self, indexes) -> None:
+        # L0 = bit0, L1 = bit2, L2 = bit4, L3 = bit6; execution needs no RW/LEN bits.
+        dr7 = 0
+        for index in indexes:
+            dr7 |= 1 << (index * 2)
+        self.call(PTRACE_POKEUSER, DR7, dr7)
+
+    def breakpoint_status(self) -> int:
+        return self.call(PTRACE_PEEKUSER, DR6)
+
+    def read_memory(self, address: int, size: int) -> bytes:
+        fd = os.open(f"/proc/{self.pid}/mem", os.O_RDONLY)
+        try:
+            return os.pread(fd, size, address)
+        finally:
+            os.close(fd)
+
+    def return_now(self) -> None:
+        """Turn the current call into an immediate return without touching code."""
+        regs = self.read_regs()
+        fd = os.open(f"/proc/{self.pid}/mem", os.O_RDONLY)
+        try:
+            value = os.pread(fd, 8, regs["rsp"])
+        finally:
+            os.close(fd)
+        return_address = struct.unpack("<Q", value)[0]
+        self.regs[REG_NAMES.index("rip")] = return_address
+        self.regs[REG_NAMES.index("rsp")] = regs["rsp"] + 8
+        self.regs[REG_NAMES.index("rax")] = 0
+        self.call(PTRACE_SETREGS, 0, ctypes.addressof(self.regs))
 
     def clear_breakpoint_status(self) -> None:
         self.call(PTRACE_POKEUSER, DR6, 0)
@@ -211,6 +260,17 @@ def main() -> int:
         type=lambda v: int(v, 0),
         default=DEFAULT_MPROTECT_OFFSET,
         help=f"EAC image-relative offset of the mprotect wrapper (default: {DEFAULT_MPROTECT_OFFSET:#x})",
+    )
+    parser.add_argument(
+        "--report-offset",
+        type=lambda v: int(v, 0),
+        default=DEFAULT_REPORT_OFFSET,
+        help=f"EAC image-relative offset of the function that reports the violation (default: {DEFAULT_REPORT_OFFSET:#x})",
+    )
+    parser.add_argument(
+        "--no-skip-report",
+        action="store_true",
+        help="leave the violation report alone (only block the header wipe)",
     )
     parser.add_argument("--wait", type=float, default=60.0, help="seconds to wait for the game to start")
     parser.add_argument("--timeout", type=float, default=120.0, help="seconds to wait for the breakpoint")
@@ -271,8 +331,21 @@ def main() -> int:
             return 1
         dll = dll_mapping(maps, args.dll)
         guard = base + args.mprotect_offset
-        print(f"EAC base {base:#x}; {args.dll} at {dll and hex(dll)}; breakpoint {guard:#x}", flush=True)
-        tracer.set_exec_breakpoint(guard)
+        skip_targets = set() if args.no_skip_report else {base + args.report_offset}
+
+        print(f"EAC base {base:#x}; {args.dll} at {dll and hex(dll)}", flush=True)
+        verify_signature(tracer, base, args.mprotect_offset, MPROTECT_SIGNATURE, "mprotect wrapper")
+        if skip_targets:
+            verify_signature(tracer, base, args.report_offset, REPORT_SIGNATURE, "violation report")
+
+        tracer.set_breakpoint(0, guard)
+        if skip_targets:
+            # Second execute breakpoint (DR1) on the function to short-circuit.
+            tracer.set_breakpoint(1, sorted(skip_targets)[0])
+            tracer.enable_breakpoints([0, 1])
+            print("skip targets: " + ", ".join(f"{t - base:#x}" for t in sorted(skip_targets)), flush=True)
+        else:
+            tracer.enable_breakpoints([0])
         tracer.call(PTRACE_CONT)
 
         deadline = time.monotonic() + args.timeout
@@ -288,23 +361,31 @@ def main() -> int:
                 continue
             sig = os.WSTOPSIG(status)
             regs = tracer.read_regs()
-            if sig == signal.SIGTRAP and tracer.breakpoint_hit():
-                current = dll_mapping(Path(f"/proc/{pid}/maps").read_text(), args.dll)
-                if current is not None:
-                    dll = current
-                targeted = regs["rip"] == guard and regs["rdi"] == dll and regs["rsi"] == 0x1000
-                print(
-                    f"mprotect addr={regs['rdi']:#x} size={regs['rsi']:#x} "
-                    f"prot={regs['rdx']:#x} -> {'DLL page' if targeted else 'other'}",
-                    flush=True,
-                )
-                if targeted:
-                    tracer.write_rdx(INVALID_PROT)
-                    blocked = True
-                    print("  prot rewritten to a value the kernel rejects; the wipe is skipped", flush=True)
-                    if not args.keep_attached:
-                        break
-                tracer.clear_breakpoint_status()
+            if sig == signal.SIGTRAP:
+                status_bits = tracer.breakpoint_status()
+                if status_bits & 0x2 and regs["rip"] in skip_targets:
+                    print(f"skipping EAC+{regs['rip'] - base:#x}", flush=True)
+                    tracer.return_now()
+                    tracer.clear_breakpoint_status()
+                    tracer.call(PTRACE_CONT)
+                    continue
+                if status_bits & 0x1:
+                    current = dll_mapping(Path(f"/proc/{pid}/maps").read_text(), args.dll)
+                    if current is not None:
+                        dll = current
+                    targeted = regs["rip"] == guard and regs["rdi"] == dll and regs["rsi"] == 0x1000
+                    print(
+                        f"mprotect addr={regs['rdi']:#x} size={regs['rsi']:#x} "
+                        f"prot={regs['rdx']:#x} -> {'DLL page' if targeted else 'other'}",
+                        flush=True,
+                    )
+                    if targeted:
+                        tracer.write_rdx(INVALID_PROT)
+                        blocked = True
+                        print("  prot rewritten to a value the kernel rejects; the wipe is skipped", flush=True)
+                        if not args.keep_attached:
+                            break
+                    tracer.clear_breakpoint_status()
             tracer.call(PTRACE_CONT, 0, 0 if sig == signal.SIGTRAP else sig)
     finally:
         try:

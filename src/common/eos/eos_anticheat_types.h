@@ -6,6 +6,7 @@
 #pragma pack(push, 8)
 
 #define EOS_ANTICHEATCLIENT_ENDSESSION_API_LATEST 1
+#define EOS_ANTICHEATCLIENT_ADDNOTIFYMESSAGETOSERVER_API_LATEST 1
 
 struct EOS_AntiCheatClient_BeginSessionOptions {
 	int32_t ApiVersion;
