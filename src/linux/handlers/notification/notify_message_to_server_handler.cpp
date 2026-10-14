@@ -38,6 +38,10 @@ void anticheat_notification::ensure_message_to_server_bound(EOS_HAntiCheatClient
 	PLOGI.printf("AntiCheatClient_AddNotifyMessageToServer bound");
 }
 
+void anticheat_notification::clear_message_to_server_bound() {
+	message_to_server_bound = false;
+}
+
 void notify_message_to_server_handler::handle(std::shared_ptr<packet> packet) {
 	auto notify_message_to_server = std::static_pointer_cast<notify_message_to_server_packet>(packet);
 

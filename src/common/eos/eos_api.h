@@ -4,6 +4,7 @@
 
 #define EOS_Success 0
 #define EOS_NS_Online 2
+#define EOS_NotConfigured 14
 
 #define EOS_EResult int
 #define EOS_ENetworkStatus int
