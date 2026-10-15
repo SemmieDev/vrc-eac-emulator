@@ -15,12 +15,6 @@ void begin_session_handler::handle(std::shared_ptr<packet> packet) {
 		return;
 	}
 
-	// UnityMain is hooked, so the game never reaches its own
-	// AddNotifyMessageToServer call; EOS still refuses to start a session without
-	// the outbound transport, so bind it here before asking.
-	anticheat_notification::ensure_message_to_server_bound(
-		anticheat_interface, EOS_ANTICHEATCLIENT_ADDNOTIFYMESSAGETOSERVER_API_LATEST);
-
 	EOS_AntiCheatClient_BeginSessionOptions options{};
 	options.ApiVersion = begin_session->api_version;
 	options.LocalUserId = begin_session->user_id;

@@ -3,6 +3,7 @@
 #include <plog/Log.h>
 
 #include "eos_utils.h"
+#include "linux/handlers/notification/notify_message_to_server_handler.h"
 
 EOS_EResult eos_anticheat::begin_session(EOS_HAntiCheatClient handle, EOS_AntiCheatClient_BeginSessionOptions const& options) {
 	typedef EOS_EResult (EOS_CALL*EOS_AntiCheatClient_BeginSession)(EOS_HAntiCheatClient, const EOS_AntiCheatClient_BeginSessionOptions*);
@@ -12,6 +13,12 @@ EOS_EResult eos_anticheat::begin_session(EOS_HAntiCheatClient handle, EOS_AntiCh
 		PLOGF.printf("Could not resolve EOS_AntiCheatClient_BeginSession");
 		return 0;
 	}
+
+	// UnityMain is hooked, so the game never reaches its own
+	// AddNotifyMessageToServer call; EOS still refuses to start a session without
+	// the outbound transport, so bind it here before asking.
+	anticheat_notification::ensure_message_to_server_bound(
+		handle, EOS_ANTICHEATCLIENT_ADDNOTIFYMESSAGETOSERVER_API_LATEST);
 
 	return eos_anticheat_client_begin_session(handle, &options);
 }
@@ -24,6 +31,9 @@ EOS_EResult eos_anticheat::end_session(EOS_HAntiCheatClient handle, EOS_AntiChea
 		PLOGF.printf("Could not resolve EOS_AntiCheatClient_EndSession");
 		return 0;
 	}
+
+	// The callback gets cleared when the session ends
+	anticheat_notification::clear_message_to_server_bound();
 
 	return eos_anticheat_client_end_session(handle, &options);
 }
