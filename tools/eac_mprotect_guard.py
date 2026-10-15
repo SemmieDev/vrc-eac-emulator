@@ -1,426 +1,517 @@
 #!/usr/bin/env python3
-"""Stop EasyAntiCheat from wiping a game-local DLL's PE header.
+"""Launch the game and patch EAC without ptrace or build-specific offsets.
 
-Why this exists
----------------
-When EAC rejects a module (a game-local DLL that is not part of the game's
-signed file list) it neutralises it by erasing the first page:
+The tool locates two native-code anchors in EAC's live memfd image:
 
-    mprotect(dll_base, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC)
-    memset  (dll_base, 0, 0x1000)
+* the mprotect wrapper used before the game-local DLL header is erased;
+* the helper immediately preceding the violation-registration entry point.
 
-Wine then calls ``RtlImageNtHeader()`` on the erased header, receives NULL and
-dereferences it: the process dies inside ntdll (``EXCEPTION_ACCESS_VIOLATION``,
-``info[1]=8``).
-
-The erasing ``memset`` is only reached when the preceding ``mprotect`` reports
-success.  This tool rewrites the ``prot`` argument of that one ``mprotect`` call
-to a value the kernel rejects, so the call fails and the VM takes its failure
-path, skipping the erase.
-
-How
----
-* attach with ptrace to the game process,
-* set an execute breakpoint on EAC's ``mprotect`` wrapper,
-* when it targets the DLL page (a single 4 KiB page), change ``prot`` to an
-  invalid value,
-* detach and let the game run.
-
-The breakpoint is a hardware breakpoint, so no single-stepping is required.
-
-Limitations
------------
-* Timing-sensitive: EAC must reach its module check after the breakpoint is set.
-* It does not make EAC accept the DLL. It only stops the header wipe.
-* ``--mprotect-offset`` is specific to the EAC build; the default was verified
-  against one build only.
-
-Usage
------
-    ./eac_mprotect_guard.py --pid 1234 --dll version.dll
-
-    ./eac_mprotect_guard.py \\
-        --exe /path/to/VRChat.exe --dll version.dll \\
-        --launcher /path/to/proton --compat /path/to/compatdata
+It redirects the wrapper to a conditional in-module stub and short-circuits the
+derived violation entry. If any signature is missing or ambiguous, nothing is
+patched and the tool exits with an error.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import os
-import signal
 import struct
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-# --- ptrace (Linux x86-64) -------------------------------------------------
-PTRACE_PEEKDATA = 2
-PTRACE_PEEKUSER = 3
-PTRACE_POKEUSER = 6
-PTRACE_CONT = 7
-PTRACE_GETREGS = 12
-PTRACE_SETREGS = 13
-PTRACE_ATTACH = 16
-PTRACE_DETACH = 17
 
-# offsetof(struct user, u_debugreg) on x86-64
-DEBUGREG_BASE = 848
-DR6 = DEBUGREG_BASE + 6 * 8
-DR7 = DEBUGREG_BASE + 7 * 8
+MPROTECT_SIGNATURE = bytes.fromhex(
+    "f30f1efa554889e5534881ec8800000048897d884889758089957cffffff"
+    "48898d70ffffff64488b042528000000488945e831c048837d88007407"
+    "48837d8000750abb00000000e996000000"
+)
 
-# x86-64 `struct user_regs_struct` field order, as returned by PTRACE_GETREGS
-REG_NAMES = (
-    "r15 r14 r13 r12 rbp rbx r11 r10 r9 r8 rax rcx rdx rsi rdi orig_rax "
-    "rip cs eflags rsp ss fs_base gs_base ds es fs gs"
-).split()
-RDX = REG_NAMES.index("rdx")
+# This helper builds the platform-specific executable path list. It remained
+# byte-identical across the two EAC builds used to derive and verify the
+# detector, while its image-relative address changed.
+REPORT_HELPER_SIGNATURE = bytes.fromhex(
+    "f30f1efa41574156415541544989f455534889fb4883ec48"
+    "64488b042528000000488944243831c04c8d6c24184c8d7424204c89ef"
+)
 
-# Image-relative offsets of the two EAC functions this tool needs. Both are
-# specific to the EAC build, so each is verified against its prologue before a
-# breakpoint is set; a mismatch is reported instead of silently doing nothing.
-DEFAULT_MPROTECT_OFFSET = 0x4DA93A
-DEFAULT_REPORT_OFFSET = 0x3599A
+REPORT_HELPER_EPILOGUE_PREFIX = bytes.fromhex(
+    "488b44243864482b0425280000007405e8"
+)
+REPORT_HELPER_EPILOGUE_SUFFIX = bytes.fromhex(
+    "4883c4485b5d415c415d415e415fc3"
+)
+NATIVE_REPORT_SIGNATURE = bytes.fromhex(
+    "f30f1efa41574156415541544189f4554889d5"
+)
 
-MPROTECT_SIGNATURE = bytes.fromhex("f30f1efa554889e5534881ec8800000048897d88")
-REPORT_SIGNATURE = bytes.fromhex("f30f1efa41574156415541544189f4554889d5")
-
-# Value handed to mprotect that the kernel rejects (EINVAL), so the call fails.
-INVALID_PROT = 0x10
+WRAPPER_HEAD_SIZE = 16
+PATCH_RETURN_ZERO = bytes.fromhex("31c0c3")
+MIN_CODE_CAVE_SIZE = 128
+MAX_MODULE_SIZE = 0x1000000
 
 
-def eac_image_base(maps: str) -> int | None:
-    """Find EAC's in-game module: an anonymous memfd view of >= 64 KiB."""
-    for line in maps.splitlines():
+@dataclass(frozen=True)
+class Mapping:
+    begin: int
+    end: int
+    permissions: str
+    offset: int
+    path: str
+
+
+class DetectionError(RuntimeError):
+    pass
+
+
+class ProcessMemory:
+    def __init__(self, pid: int):
+        self.fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+    def read(self, address: int, size: int) -> bytes:
+        data = os.pread(self.fd, size, address)
+        if len(data) != size:
+            raise OSError(f"short read at {address:#x}: {len(data)} of {size} bytes")
+        return data
+
+    def write(self, address: int, data: bytes) -> None:
+        written = os.pwrite(self.fd, data, address)
+        if written != len(data):
+            raise OSError(f"short write at {address:#x}: {written} of {len(data)} bytes")
+
+
+def parse_maps(text: str) -> list[Mapping]:
+    mappings = []
+    for line in text.splitlines():
         fields = line.split(maxsplit=5)
-        if len(fields) < 6 or "/memfd:" not in fields[5] or fields[2] != "00000000":
+        if len(fields) < 5:
             continue
-        begin, end = (int(v, 16) for v in fields[0].split("-"))
-        if end - begin >= 0x10000:
-            return begin
-    return None
+        begin, end = (int(value, 16) for value in fields[0].split("-"))
+        mappings.append(
+            Mapping(
+                begin=begin,
+                end=end,
+                permissions=fields[1],
+                offset=int(fields[2], 16),
+                path=fields[5] if len(fields) == 6 else "",
+            )
+        )
+    return mappings
 
 
-def dll_mapping(maps: str, name: str) -> int | None:
-    """Find the first file-backed page of a named DLL."""
-    suffix = "/" + name.lower()
-    for line in maps.splitlines():
-        fields = line.split(maxsplit=5)
-        if len(fields) < 6 or fields[2] != "00000000":
-            continue
-        if fields[5].lower().replace("\\", "/").endswith(suffix):
-            return int(fields[0].split("-")[0], 16)
-    return None
+def find_eac_mappings(mappings: list[Mapping]) -> list[Mapping]:
+    candidates = [
+        mapping
+        for mapping in mappings
+        if mapping.offset == 0
+        and mapping.end - mapping.begin >= 0x10000
+        and "/memfd:" in mapping.path
+    ]
+    if len(candidates) != 1:
+        raise DetectionError(
+            f"expected one EAC memfd base mapping, found {len(candidates)}"
+        )
+
+    base_mapping = candidates[0]
+    module = [
+        mapping
+        for mapping in mappings
+        if mapping.path == base_mapping.path
+        and base_mapping.begin <= mapping.begin < base_mapping.begin + MAX_MODULE_SIZE
+    ]
+    if not module:
+        raise DetectionError("EAC mappings disappeared")
+    return sorted(module, key=lambda mapping: mapping.offset)
 
 
-def verify_signature(tracer: "Tracer", base: int, offset: int, signature: bytes, label: str) -> bool:
-    """Check the prologue so a stale offset is reported instead of silently ignored."""
-    address = base + offset
-    observed = tracer.read_memory(address, len(signature))
-    if observed == signature:
-        print(f"{label} {offset:#x}: prologue ok", flush=True)
-        return True
-    print(
-        f"{label} {offset:#x}: PROLOGUE MISMATCH\n"
-        f"  expected {signature.hex()}\n"
-        f"  observed {observed.hex()}\n"
-        f"  the EAC build probably changed; re-derive the offset",
-        file=sys.stderr,
-        flush=True,
+def executable_mappings(module: list[Mapping]) -> list[Mapping]:
+    executable = [mapping for mapping in module if "x" in mapping.permissions]
+    if not executable:
+        raise DetectionError("EAC has no executable mapping")
+    return executable
+
+
+def find_all(data: bytes, pattern: bytes) -> list[int]:
+    matches = []
+    start = 0
+    while True:
+        found = data.find(pattern, start)
+        if found < 0:
+            return matches
+        matches.append(found)
+        start = found + 1
+
+
+def find_unique_pattern(
+    memory: ProcessMemory,
+    mappings: list[Mapping],
+    pattern: bytes,
+    label: str,
+) -> int:
+    matches = []
+    for mapping in mappings:
+        data = memory.read(mapping.begin, mapping.end - mapping.begin)
+        matches.extend(mapping.begin + offset for offset in find_all(data, pattern))
+    if len(matches) != 1:
+        offsets = ", ".join(f"{address:#x}" for address in matches) or "none"
+        raise DetectionError(
+            f"{label} signature is not unique ({len(matches)} matches: {offsets})"
+        )
+    return matches[0]
+
+
+def address_in_mappings(address: int, mappings: list[Mapping]) -> bool:
+    return any(mapping.begin <= address < mapping.end for mapping in mappings)
+
+
+def report_entry_after_helper(
+    memory: ProcessMemory,
+    helper: int,
+    executable: list[Mapping],
+) -> tuple[int, str]:
+    containing = next(
+        (mapping for mapping in executable if mapping.begin <= helper < mapping.end),
+        None,
     )
-    return False
+    if containing is None:
+        raise DetectionError("report helper is outside executable mappings")
+
+    size = min(0x300, containing.end - helper)
+    body = memory.read(helper, size)
+    matches = []
+    start = 0
+    while True:
+        prefix = body.find(REPORT_HELPER_EPILOGUE_PREFIX, start)
+        if prefix < 0:
+            break
+        suffix = prefix + len(REPORT_HELPER_EPILOGUE_PREFIX) + 4
+        if body[suffix:suffix + len(REPORT_HELPER_EPILOGUE_SUFFIX)] == REPORT_HELPER_EPILOGUE_SUFFIX:
+            matches.append(suffix + len(REPORT_HELPER_EPILOGUE_SUFFIX))
+        start = prefix + 1
+
+    if len(matches) != 1:
+        raise DetectionError(
+            f"expected one report-helper epilogue, found {len(matches)}"
+        )
+
+    entry = helper + matches[0]
+    head = memory.read(entry, 24)
+    if head.startswith(NATIVE_REPORT_SIGNATURE):
+        return entry, "native prologue"
+
+    if head[0] == 0xE9:
+        target = entry + 5 + struct.unpack_from("<i", head, 1)[0]
+        descriptor = (
+            head[5:7] == b"\x48\xb8"
+            and head[15:19] == b"\x49\x89\x84\x24"
+            and head[20:23] == b"\x01\x00\x00"
+        )
+        if address_in_mappings(target, executable) and descriptor:
+            return entry, f"VM bridge to {target:#x}"
+
+    raise DetectionError(
+        f"unsupported violation-entry shape at {entry:#x}: {head.hex()}"
+    )
 
 
-def find_game_pid(exe: str, prefix: str | None) -> int | None:
-    """Locate the game process by its Wine (Z:) argv[0] and optional WINEPREFIX."""
-    want = ("Z:" + exe.replace("/", "\\")).lower().encode()
+def find_code_cave(
+    memory: ProcessMemory,
+    executable: list[Mapping],
+    size: int,
+) -> int:
+    for mapping in executable:
+        data = memory.read(mapping.begin, mapping.end - mapping.begin)
+        run_start = None
+        for index in range(len(data) + 1):
+            is_padding = index < len(data) and data[index] in (0x00, 0x90, 0xCC)
+            if is_padding:
+                if run_start is None:
+                    run_start = index
+            else:
+                if run_start is not None and index - run_start >= size:
+                    return mapping.begin + run_start
+                run_start = None
+    raise DetectionError(f"no executable code cave of at least {size} bytes")
+
+
+def build_guard_stub(
+    eac_base: int,
+    wrapper: int,
+    cave: int,
+    original_head: bytes,
+) -> bytes:
+    # Fail only the observed erase shape: one page below EAC, with PROT_RWX.
+    # All other calls execute the original wrapper unchanged.
+    stub = bytearray()
+    stub += bytes.fromhex("f30f1efa")
+    stub += bytes.fromhex("4881fe00100000")
+    size_jump = len(stub)
+    stub += bytes.fromhex("0f8500000000")
+    stub += bytes.fromhex("83fa07")
+    protection_jump = len(stub)
+    stub += bytes.fromhex("0f8500000000")
+    stub += b"\x48\xb8" + struct.pack("<Q", eac_base)
+    stub += bytes.fromhex("4839c7")
+    range_jump = len(stub)
+    stub += bytes.fromhex("0f8300000000")
+    stub += PATCH_RETURN_ZERO
+
+    original = len(stub)
+    stub += original_head
+    jump_back = len(stub)
+    stub += b"\xe9\x00\x00\x00\x00"
+
+    for jump in (size_jump, protection_jump, range_jump):
+        struct.pack_into("<i", stub, jump + 2, original - (jump + 6))
+    struct.pack_into(
+        "<i",
+        stub,
+        jump_back + 1,
+        wrapper + WRAPPER_HEAD_SIZE - (cave + jump_back + 5),
+    )
+    return bytes(stub)
+
+
+def module_sha256(memory: ProcessMemory, module: list[Mapping]) -> str:
+    digest = hashlib.sha256()
+    position = 0
+    for mapping in module:
+        if mapping.offset > position:
+            digest.update(b"\0" * (mapping.offset - position))
+        data = memory.read(mapping.begin, mapping.end - mapping.begin)
+        digest.update(data)
+        position = mapping.offset + len(data)
+    return digest.hexdigest()
+
+
+def find_game_pid(exe: Path, prefix: Path) -> int | None:
+    wanted_exe = ("Z:" + str(exe).replace("/", "\\")).lower().encode()
+    wanted_prefix = str(prefix).rstrip("/")
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
             argv = (entry / "cmdline").read_bytes().split(b"\0")
-            if not argv or argv[0].lower() != want:
+            if not argv or argv[0].lower() != wanted_exe:
                 continue
-            if prefix is not None:
-                env = dict(
-                    item.split(b"=", 1)
-                    for item in (entry / "environ").read_bytes().split(b"\0")
-                    if b"=" in item
-                )
-                if env.get(b"WINEPREFIX", b"").decode().rstrip("/") != prefix:
-                    continue
-            return int(entry.name)
+            environment = dict(
+                item.split(b"=", 1)
+                for item in (entry / "environ").read_bytes().split(b"\0")
+                if b"=" in item
+            )
+            if environment.get(b"WINEPREFIX", b"").decode().rstrip("/") == wanted_prefix:
+                return int(entry.name)
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             continue
     return None
 
 
-class Tracer:
-    def __init__(self, pid: int):
-        self.pid = pid
-        self.libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        self._ptrace = self.libc.ptrace
-        self._ptrace.argtypes = [
-            ctypes.c_uint,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        self._ptrace.restype = ctypes.c_long
-        self.regs = (ctypes.c_ulonglong * len(REG_NAMES))()
-
-    def call(self, request: int, addr: int = 0, data: int = 0) -> int:
-        ctypes.set_errno(0)
-        result = self._ptrace(request, self.pid, addr, data)
-        if result == -1 and ctypes.get_errno():
-            raise OSError(ctypes.get_errno(), f"ptrace request={request}")
-        return result
-
-    def attach(self) -> None:
-        self.call(PTRACE_ATTACH)
-        os.waitpid(self.pid, 0)
-
-    def detach(self) -> None:
-        self.call(PTRACE_DETACH, 0, 0)
-
-    def read_regs(self) -> dict[str, int]:
-        self.call(PTRACE_GETREGS, 0, ctypes.addressof(self.regs))
-        return dict(zip(REG_NAMES, self.regs))
-
-    def write_rdx(self, value: int) -> None:
-        self.regs[RDX] = value
-        self.call(PTRACE_SETREGS, 0, ctypes.addressof(self.regs))
-
-    def set_breakpoint(self, index: int, address: int) -> None:
-        self.call(PTRACE_POKEUSER, DEBUGREG_BASE + index * 8, address)
-
-    def enable_breakpoints(self, indexes) -> None:
-        # L0 = bit0, L1 = bit2, L2 = bit4, L3 = bit6; execution needs no RW/LEN bits.
-        dr7 = 0
-        for index in indexes:
-            dr7 |= 1 << (index * 2)
-        self.call(PTRACE_POKEUSER, DR7, dr7)
-
-    def breakpoint_status(self) -> int:
-        return self.call(PTRACE_PEEKUSER, DR6)
-
-    def read_memory(self, address: int, size: int) -> bytes:
-        fd = os.open(f"/proc/{self.pid}/mem", os.O_RDONLY)
-        try:
-            return os.pread(fd, size, address)
-        finally:
-            os.close(fd)
-
-    def return_now(self) -> None:
-        """Turn the current call into an immediate return without touching code."""
-        regs = self.read_regs()
-        fd = os.open(f"/proc/{self.pid}/mem", os.O_RDONLY)
-        try:
-            value = os.pread(fd, 8, regs["rsp"])
-        finally:
-            os.close(fd)
-        return_address = struct.unpack("<Q", value)[0]
-        self.regs[REG_NAMES.index("rip")] = return_address
-        self.regs[REG_NAMES.index("rsp")] = regs["rsp"] + 8
-        self.regs[REG_NAMES.index("rax")] = 0
-        self.call(PTRACE_SETREGS, 0, ctypes.addressof(self.regs))
-
-    def clear_breakpoint_status(self) -> None:
-        self.call(PTRACE_POKEUSER, DR6, 0)
+def dll_mapping(mappings: list[Mapping], dll: Path) -> int | None:
+    wanted = str(dll).lower().replace("\\", "/")
+    for mapping in mappings:
+        path = mapping.path.lower().replace("\\", "/")
+        if mapping.offset == 0 and path == wanted:
+            return mapping.begin
+    return None
 
 
 def become_subreaper() -> None:
-    """Become a child subreaper so the game process can be traced.
-
-    The game is a grandchild of the launcher; with ptrace_scope=1 an unrelated
-    process cannot attach to it. Reparenting the orphaned descendants to us
-    makes the attach permitted.
-    """
-    pr_set_child_subreaper = 36
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    if libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) != 0:
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER)")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--pid", type=int, help="attach to a running game process")
-    parser.add_argument("--dll", required=True, help="DLL file name, e.g. version.dll")
-    parser.add_argument("--exe", help="path to the game executable (required to launch)")
-    parser.add_argument("--launcher", help="wine/proton binary (required to launch)")
-    parser.add_argument("--compat", help="STEAM_COMPAT_DATA_PATH; contains pfx/ (to launch)")
-    parser.add_argument("--steam-client", help="STEAM_COMPAT_CLIENT_INSTALL_PATH (to launch)")
-    parser.add_argument("--overrides", help="WINEDLLOVERRIDES (default: <dll>=n,b)")
-    parser.add_argument(
-        "--mprotect-offset",
-        type=lambda v: int(v, 0),
-        default=DEFAULT_MPROTECT_OFFSET,
-        help=f"EAC image-relative offset of the mprotect wrapper (default: {DEFAULT_MPROTECT_OFFSET:#x})",
-    )
-    parser.add_argument(
-        "--report-offset",
-        type=lambda v: int(v, 0),
-        default=DEFAULT_REPORT_OFFSET,
-        help=f"EAC image-relative offset of the function that reports the violation (default: {DEFAULT_REPORT_OFFSET:#x})",
-    )
-    parser.add_argument(
-        "--no-skip-report",
-        action="store_true",
-        help="leave the violation report alone (only block the header wipe)",
-    )
-    parser.add_argument("--wait", type=float, default=60.0, help="seconds to wait for the game to start")
-    parser.add_argument("--timeout", type=float, default=120.0, help="seconds to wait for the breakpoint")
-    parser.add_argument("--keep-attached", action="store_true", help="stay attached until the timeout instead of detaching at once")
-    parser.add_argument("--wait-after", type=float, default=30.0, help="seconds to keep watching after detaching, then re-check the header")
-    args = parser.parse_args()
+def existing_path(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.exists():
+        raise argparse.ArgumentTypeError(f"path does not exist: {path}")
+    return path
 
-    launch = (args.exe, args.launcher, args.compat)
-    if args.pid is None:
-        missing = [name for name, value in zip(("--exe", "--launcher", "--compat"), launch) if not value]
-        if missing:
-            parser.error(f"{', '.join(missing)} required unless --pid is given")
 
-    process = None
-    if args.pid:
-        pid = args.pid
-        prefix = None
-    else:
-        become_subreaper()
-        overrides = args.overrides or f"{args.dll}=n,b"
-        prefix = str(Path(args.compat) / "pfx")
-        env = os.environ.copy()
-        env["STEAM_COMPAT_DATA_PATH"] = str(args.compat)
-        if args.steam_client:
-            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(args.steam_client)
-        env["WINEDLLOVERRIDES"] = overrides
-        env["PROTON_LOG"] = "0"
-        process = subprocess.Popen(
-            [args.launcher, "run", str(Path(args.exe).with_name("launch.exe"))],
-            env=env,
-            cwd=str(Path(args.exe).parent),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        print(f"launched (pid {process.pid}); waiting for {args.exe}", flush=True)
-        deadline = time.monotonic() + args.wait
-        pid = None
-        while time.monotonic() < deadline:
-            pid = find_game_pid(args.exe, prefix)
-            if pid:
-                break
-            time.sleep(0.02)
-        if not pid:
-            print("game process not found", file=sys.stderr)
-            return 1
+def install_patches(pid: int) -> tuple[int, int, str]:
+    maps_text = Path(f"/proc/{pid}/maps").read_text()
+    module = find_eac_mappings(parse_maps(maps_text))
+    executable = executable_mappings(module)
+    base = next(mapping.begin for mapping in module if mapping.offset == 0)
 
-    print(f"attaching to pid {pid}", flush=True)
-    tracer = Tracer(pid)
-    blocked = False
-    dll = None
+    memory = ProcessMemory(pid)
     try:
-        tracer.attach()
+        wrapper = find_unique_pattern(
+            memory, executable, MPROTECT_SIGNATURE, "mprotect wrapper"
+        )
+        helper = find_unique_pattern(
+            memory, executable, REPORT_HELPER_SIGNATURE, "report helper"
+        )
+        report_entry, report_shape = report_entry_after_helper(
+            memory, helper, executable
+        )
+        fingerprint = module_sha256(memory, module)
 
-        maps = Path(f"/proc/{pid}/maps").read_text()
-        base = eac_image_base(maps)
-        if not base:
-            print("EAC module not found in maps", file=sys.stderr)
-            return 1
-        dll = dll_mapping(maps, args.dll)
-        guard = base + args.mprotect_offset
-        skip_targets = set() if args.no_skip_report else {base + args.report_offset}
+        original_wrapper = memory.read(wrapper, WRAPPER_HEAD_SIZE)
+        if not original_wrapper.startswith(MPROTECT_SIGNATURE[:WRAPPER_HEAD_SIZE]):
+            raise DetectionError("mprotect wrapper changed during detection")
 
-        print(f"EAC base {base:#x}; {args.dll} at {dll and hex(dll)}", flush=True)
-        verify_signature(tracer, base, args.mprotect_offset, MPROTECT_SIGNATURE, "mprotect wrapper")
-        if skip_targets:
-            verify_signature(tracer, base, args.report_offset, REPORT_SIGNATURE, "violation report")
+        cave = find_code_cave(memory, executable, MIN_CODE_CAVE_SIZE)
+        stub = build_guard_stub(base, wrapper, cave, original_wrapper)
+        if len(stub) > MIN_CODE_CAVE_SIZE:
+            raise DetectionError("guard stub no longer fits the selected code cave")
 
-        tracer.set_breakpoint(0, guard)
-        if skip_targets:
-            # Second execute breakpoint (DR1) on the function to short-circuit.
-            tracer.set_breakpoint(1, sorted(skip_targets)[0])
-            tracer.enable_breakpoints([0, 1])
-            print("skip targets: " + ", ".join(f"{t - base:#x}" for t in sorted(skip_targets)), flush=True)
-        else:
-            tracer.enable_breakpoints([0])
-        tracer.call(PTRACE_CONT)
+        print(f"EAC base: {base:#x}", flush=True)
+        print(f"EAC mapped-image SHA-256: {fingerprint}", flush=True)
+        print(f"mprotect wrapper: EAC+{wrapper - base:#x}", flush=True)
+        print(f"report helper: EAC+{helper - base:#x}", flush=True)
+        print(
+            f"violation entry: EAC+{report_entry - base:#x} ({report_shape})",
+            flush=True,
+        )
+        print(f"code cave: EAC+{cave - base:#x}", flush=True)
 
-        deadline = time.monotonic() + args.timeout
-        while time.monotonic() < deadline:
-            waited, status = os.waitpid(pid, os.WNOHANG)
-            if not waited:
-                time.sleep(0.01)
-                continue
-            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-                print("game exited before the wipe", flush=True)
-                return 1
-            if not os.WIFSTOPPED(status):
-                continue
-            sig = os.WSTOPSIG(status)
-            regs = tracer.read_regs()
-            if sig == signal.SIGTRAP:
-                status_bits = tracer.breakpoint_status()
-                if status_bits & 0x2 and regs["rip"] in skip_targets:
-                    print(f"skipping EAC+{regs['rip'] - base:#x}", flush=True)
-                    tracer.return_now()
-                    tracer.clear_breakpoint_status()
-                    tracer.call(PTRACE_CONT)
-                    continue
-                if status_bits & 0x1:
-                    current = dll_mapping(Path(f"/proc/{pid}/maps").read_text(), args.dll)
-                    if current is not None:
-                        dll = current
-                    targeted = regs["rip"] == guard and regs["rdi"] == dll and regs["rsi"] == 0x1000
-                    print(
-                        f"mprotect addr={regs['rdi']:#x} size={regs['rsi']:#x} "
-                        f"prot={regs['rdx']:#x} -> {'DLL page' if targeted else 'other'}",
-                        flush=True,
-                    )
-                    if targeted:
-                        tracer.write_rdx(INVALID_PROT)
-                        blocked = True
-                        print("  prot rewritten to a value the kernel rejects; the wipe is skipped", flush=True)
-                        if not args.keep_attached:
-                            break
-                    tracer.clear_breakpoint_status()
-            tracer.call(PTRACE_CONT, 0, 0 if sig == signal.SIGTRAP else sig)
-    finally:
+        wrapper_patch = bytearray(
+            b"\xe9" + struct.pack("<i", cave - (wrapper + 5))
+        )
+        wrapper_patch += b"\x90" * (WRAPPER_HEAD_SIZE - len(wrapper_patch))
+
+        writes = [
+            (cave, stub, "guard stub"),
+            (wrapper, bytes(wrapper_patch), "mprotect wrapper"),
+            (report_entry, PATCH_RETURN_ZERO, "violation entry"),
+        ]
+        originals = [
+            (address, memory.read(address, len(patch)))
+            for address, patch, _ in writes
+        ]
+        applied = 0
         try:
-            tracer.detach()
+            for address, patch, label in writes:
+                applied += 1
+                memory.write(address, patch)
+                if memory.read(address, len(patch)) != patch:
+                    raise OSError(f"{label} patch verification failed")
         except OSError:
-            pass
+            for address, original in reversed(originals[:applied]):
+                memory.write(address, original)
+            raise
 
-    if not blocked:
-        print("did not intercept the wipe within the timeout", file=sys.stderr)
-        return 1
-    print("detached; the game keeps running", flush=True)
+        print("patches installed and verified", flush=True)
+        return base, report_entry, fingerprint
+    finally:
+        memory.close()
 
-    if dll and args.wait_after > 0:
-        print(f"watching for {args.wait_after:g}s ...", flush=True)
-        deadline = time.monotonic() + args.wait_after
-        alive = True
+
+def wait_for_eac(pid: int, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        if not Path(f"/proc/{pid}").exists():
+            raise RuntimeError("game exited before EAC loaded")
+        try:
+            mappings = parse_maps(Path(f"/proc/{pid}/maps").read_text())
+            module = find_eac_mappings(mappings)
+            executable_mappings(module)
+            return
+        except (DetectionError, FileNotFoundError, ProcessLookupError) as error:
+            last_error = error
+        time.sleep(0.002)
+    raise RuntimeError(f"EAC module did not load: {last_error}")
+
+
+def watch_dll_header(pid: int, dll: Path, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    seen = False
+    memory = ProcessMemory(pid)
+    try:
         while time.monotonic() < deadline:
             if not Path(f"/proc/{pid}").exists():
-                alive = False
-                break
-            time.sleep(0.2)
-        if not alive:
-            print("game process ended while watching", file=sys.stderr)
+                print("game process ended while checking the DLL", file=sys.stderr)
+                return False
+            mappings = parse_maps(Path(f"/proc/{pid}/maps").read_text())
+            base = dll_mapping(mappings, dll)
+            if base is not None:
+                seen = True
+                header = memory.read(base, 2)
+                if header != b"MZ":
+                    print(f"DLL header changed to {header!r}", file=sys.stderr)
+                    return False
+            time.sleep(0.1)
+    finally:
+        memory.close()
+
+    if not seen:
+        print(f"DLL mapping was not observed: {dll}", file=sys.stderr)
+        return False
+    print(f"DLL header remained b'MZ' for {timeout:g}s", flush=True)
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--exe", required=True, type=existing_path, help="game executable path")
+    parser.add_argument("--dll", required=True, type=existing_path, help="game-local DLL path")
+    parser.add_argument("--launcher", required=True, type=existing_path, help="Wine/Proton executable path")
+    parser.add_argument("--compat", required=True, type=existing_path, help="STEAM_COMPAT_DATA_PATH")
+    parser.add_argument("--steam-client", required=True, type=existing_path, help="STEAM_COMPAT_CLIENT_INSTALL_PATH")
+    parser.add_argument("--overrides", help="WINEDLLOVERRIDES (default: <DLL name>=n,b)")
+    parser.add_argument("--wait", type=float, default=90.0, help="seconds to wait for the game and EAC")
+    parser.add_argument("--wait-after", type=float, default=30.0, help="seconds to verify that the DLL header survives")
+    args = parser.parse_args()
+
+    if not args.exe.is_file() or not args.dll.is_file() or not args.launcher.is_file():
+        parser.error("--exe, --dll, and --launcher must be files")
+    if not args.compat.is_dir() or not args.steam_client.is_dir():
+        parser.error("--compat and --steam-client must be directories")
+    if args.dll.parent != args.exe.parent:
+        parser.error("--dll must be in the same directory as --exe")
+
+    prefix = args.compat / "pfx"
+    launch_exe = args.exe.with_name("launch.exe")
+    if not prefix.is_dir():
+        parser.error(f"Wine prefix does not exist: {prefix}")
+    if not launch_exe.is_file():
+        parser.error(f"EAC launcher does not exist: {launch_exe}")
+
+    become_subreaper()
+    environment = os.environ.copy()
+    environment["STEAM_COMPAT_DATA_PATH"] = str(args.compat)
+    environment["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(args.steam_client)
+    environment["WINEDLLOVERRIDES"] = args.overrides or f"{args.dll.name}=n,b"
+    environment["PROTON_LOG"] = "0"
+
+    process = subprocess.Popen(
+        [str(args.launcher), "run", str(launch_exe)],
+        env=environment,
+        cwd=str(args.exe.parent),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"launcher started (pid {process.pid})", flush=True)
+
+    deadline = time.monotonic() + args.wait
+    pid = None
+    while time.monotonic() < deadline:
+        pid = find_game_pid(args.exe, prefix)
+        if pid is not None:
+            break
+        time.sleep(0.01)
+    if pid is None:
+        print("game process not found", file=sys.stderr)
+        return 1
+
+    print(f"game pid: {pid}", flush=True)
+    try:
+        wait_for_eac(pid, max(0.0, deadline - time.monotonic()))
+        install_patches(pid)
+        if args.wait_after > 0 and not watch_dll_header(pid, args.dll, args.wait_after):
             return 1
-        try:
-            fd = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
-            try:
-                header = os.pread(fd, 2, dll)
-            finally:
-                os.close(fd)
-            print(f"{args.dll} header after {args.wait_after:g}s: {header!r} (expected b'MZ')", flush=True)
-            if header != b"MZ":
-                return 1
-        except OSError as error:
-            print(f"could not re-read the header: {error}", flush=True)
+    except (DetectionError, OSError, RuntimeError) as error:
+        print(f"error: {error}", file=sys.stderr, flush=True)
+        return 1
     return 0
 
 

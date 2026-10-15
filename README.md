@@ -12,14 +12,15 @@ It includes bug fixes, improvements, and future enhancements.
 ## Running (Linux side)
 
 `tools/eac_mprotect_guard.py` starts the game and stops EAC from doing two
-things: erasing the first page of the game-local DLL, and reporting that DLL to
-the server, which drops the session. Both EAC offsets are checked against their
-prologues first, so an EAC update is reported instead of silently ignored.
+things: erasing the first page of the game-local DLL, and registering that DLL
+as a violation. It finds both patch points from code signatures and structural
+checks instead of fixed offsets. If an EAC update changes those structures, the
+tool stops without patching an uncertain location.
 
 ```sh
 python3 tools/eac_mprotect_guard.py \
     --exe ~/VRChat/VRChat.exe \
-    --dll version.dll \
+    --dll ~/VRChat/version.dll \
     --launcher "$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/proton" \
     --compat ~/proton \
     --steam-client ~/.steam/steam
